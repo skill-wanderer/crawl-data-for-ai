@@ -1,0 +1,492 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Web Crawler for AI</title>
+    <style>
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #0f172a;
+            color: #e2e8f0;
+            min-height: 100vh;
+        }
+
+        .container {
+            max-width: 900px;
+            margin: 0 auto;
+            padding: 2rem 1rem;
+        }
+
+        h1 {
+            font-size: 1.75rem;
+            font-weight: 700;
+            margin-bottom: 0.5rem;
+            color: #f8fafc;
+        }
+
+        .subtitle {
+            color: #94a3b8;
+            margin-bottom: 2rem;
+            font-size: 0.95rem;
+        }
+
+        /* Card */
+        .card {
+            background: #1e293b;
+            border: 1px solid #334155;
+            border-radius: 12px;
+            padding: 1.5rem;
+            margin-bottom: 1.5rem;
+        }
+
+        .card h2 {
+            font-size: 1.15rem;
+            margin-bottom: 1rem;
+            color: #f1f5f9;
+        }
+
+        /* Form */
+        .form-row {
+            display: flex;
+            gap: 0.75rem;
+        }
+
+        input[type="text"] {
+            flex: 1;
+            padding: 0.65rem 1rem;
+            border: 1px solid #475569;
+            border-radius: 8px;
+            background: #0f172a;
+            color: #e2e8f0;
+            font-size: 0.95rem;
+            outline: none;
+            transition: border-color 0.2s;
+        }
+
+        input[type="text"]:focus {
+            border-color: #6366f1;
+        }
+
+        input[type="text"]::placeholder {
+            color: #64748b;
+        }
+
+        button {
+            padding: 0.65rem 1.25rem;
+            border: none;
+            border-radius: 8px;
+            font-size: 0.9rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: background 0.2s, opacity 0.2s;
+        }
+
+        button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        .btn-primary {
+            background: #6366f1;
+            color: #fff;
+        }
+
+        .btn-primary:hover:not(:disabled) {
+            background: #4f46e5;
+        }
+
+        .btn-danger {
+            background: #dc2626;
+            color: #fff;
+            padding: 0.4rem 0.75rem;
+            font-size: 0.8rem;
+        }
+
+        .btn-danger:hover:not(:disabled) {
+            background: #b91c1c;
+        }
+
+        .btn-secondary {
+            background: #334155;
+            color: #e2e8f0;
+            padding: 0.4rem 0.75rem;
+            font-size: 0.8rem;
+        }
+
+        .btn-secondary:hover:not(:disabled) {
+            background: #475569;
+        }
+
+        /* Stats bar */
+        .stats-bar {
+            display: flex;
+            gap: 1.5rem;
+            margin-bottom: 1.5rem;
+            flex-wrap: wrap;
+        }
+
+        .stat {
+            background: #1e293b;
+            border: 1px solid #334155;
+            border-radius: 10px;
+            padding: 1rem 1.5rem;
+            min-width: 150px;
+        }
+
+        .stat-value {
+            font-size: 1.4rem;
+            font-weight: 700;
+            color: #6366f1;
+        }
+
+        .stat-label {
+            font-size: 0.8rem;
+            color: #94a3b8;
+            margin-top: 0.25rem;
+        }
+
+        /* Domain table */
+        .domain-table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+
+        .domain-table th {
+            text-align: left;
+            padding: 0.6rem 0.75rem;
+            font-size: 0.8rem;
+            color: #94a3b8;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            border-bottom: 1px solid #334155;
+        }
+
+        .domain-table td {
+            padding: 0.75rem;
+            border-bottom: 1px solid #1e293b;
+            font-size: 0.9rem;
+        }
+
+        .domain-table tbody tr:hover {
+            background: #1e293b80;
+        }
+
+        /* Status badge */
+        .badge {
+            display: inline-block;
+            padding: 0.2rem 0.6rem;
+            border-radius: 999px;
+            font-size: 0.75rem;
+            font-weight: 600;
+        }
+
+        .badge-crawling { background: #422006; color: #fbbf24; }
+        .badge-embedding { background: #172554; color: #60a5fa; }
+        .badge-completed { background: #052e16; color: #4ade80; }
+        .badge-failed { background: #450a0a; color: #f87171; }
+        .badge-unknown { background: #1e293b; color: #94a3b8; }
+
+        /* Toast */
+        .toast-container {
+            position: fixed;
+            bottom: 1.5rem;
+            right: 1.5rem;
+            z-index: 1000;
+            display: flex;
+            flex-direction: column;
+            gap: 0.5rem;
+        }
+
+        .toast {
+            padding: 0.75rem 1.25rem;
+            border-radius: 8px;
+            font-size: 0.85rem;
+            animation: slideIn 0.3s ease;
+            max-width: 400px;
+        }
+
+        .toast-success { background: #052e16; color: #4ade80; border: 1px solid #166534; }
+        .toast-error { background: #450a0a; color: #f87171; border: 1px solid #991b1b; }
+        .toast-info { background: #172554; color: #60a5fa; border: 1px solid #1e40af; }
+
+        @keyframes slideIn {
+            from { transform: translateX(100%); opacity: 0; }
+            to { transform: translateX(0); opacity: 1; }
+        }
+
+        .empty-state {
+            text-align: center;
+            padding: 2rem;
+            color: #64748b;
+        }
+
+        .actions {
+            display: flex;
+            gap: 0.5rem;
+        }
+
+        /* Loading spinner */
+        .spinner {
+            display: inline-block;
+            width: 14px;
+            height: 14px;
+            border: 2px solid #ffffff40;
+            border-top-color: #fff;
+            border-radius: 50%;
+            animation: spin 0.6s linear infinite;
+            vertical-align: middle;
+            margin-right: 0.4rem;
+        }
+
+        @keyframes spin { to { transform: rotate(360deg); } }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🕷️ Web Crawler for AI</h1>
+        <p class="subtitle">Crawl websites and store content in Qdrant vector database for AI chatbot consumption.</p>
+
+        <!-- Stats -->
+        <div class="stats-bar">
+            <div class="stat">
+                <div class="stat-value" id="totalVectors">-</div>
+                <div class="stat-label">Total Vectors</div>
+            </div>
+            <div class="stat">
+                <div class="stat-value" id="totalDomains">-</div>
+                <div class="stat-label">Domains</div>
+            </div>
+            <div class="stat">
+                <div class="stat-value" id="collectionStatus">-</div>
+                <div class="stat-label">Collection Status</div>
+            </div>
+        </div>
+
+        <!-- Add domain -->
+        <div class="card">
+            <h2>Add Domain to Crawl</h2>
+            <form id="crawlForm" class="form-row">
+                <input type="text" id="urlInput" placeholder="https://skill-wanderer.com" required>
+                <button type="submit" class="btn-primary" id="crawlBtn">Crawl</button>
+            </form>
+        </div>
+
+        <!-- Domains list -->
+        <div class="card">
+            <h2>Crawled Domains</h2>
+            <div id="domainsList">
+                <div class="empty-state">No domains crawled yet.</div>
+            </div>
+        </div>
+    </div>
+
+    <div class="toast-container" id="toastContainer"></div>
+
+    <script>
+        const API = '';
+
+        // --- Toast notifications ---
+        function showToast(message, type = 'info') {
+            const container = document.getElementById('toastContainer');
+            const toast = document.createElement('div');
+            toast.className = `toast toast-${type}`;
+            toast.textContent = message;
+            container.appendChild(toast);
+            setTimeout(() => toast.remove(), 4000);
+        }
+
+        // --- Fetch helpers ---
+        async function apiGet(path) {
+            const res = await fetch(`${API}${path}`);
+            if (!res.ok) {
+                const err = await res.json().catch(() => ({}));
+                throw new Error(err.detail || `Request failed: ${res.status}`);
+            }
+            return res.json();
+        }
+
+        async function apiPost(path, body) {
+            const res = await fetch(`${API}${path}`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body),
+            });
+            if (!res.ok) {
+                const err = await res.json().catch(() => ({}));
+                throw new Error(err.detail || `Request failed: ${res.status}`);
+            }
+            return res.json();
+        }
+
+        async function apiDelete(path) {
+            const res = await fetch(`${API}${path}`, { method: 'DELETE' });
+            if (!res.ok) {
+                const err = await res.json().catch(() => ({}));
+                throw new Error(err.detail || `Request failed: ${res.status}`);
+            }
+            return res.json();
+        }
+
+        // --- Load stats ---
+        async function loadStats() {
+            try {
+                const stats = await apiGet('/api/stats');
+                document.getElementById('totalVectors').textContent = stats.points_count ?? 0;
+                document.getElementById('collectionStatus').textContent = stats.status ?? '-';
+            } catch {
+                document.getElementById('totalVectors').textContent = '?';
+                document.getElementById('collectionStatus').textContent = 'error';
+            }
+        }
+
+        // --- Load domains ---
+        async function loadDomains() {
+            try {
+                const data = await apiGet('/api/domains');
+                const domains = data.domains || [];
+                document.getElementById('totalDomains').textContent = domains.length;
+                renderDomains(domains);
+            } catch {
+                document.getElementById('totalDomains').textContent = '?';
+            }
+        }
+
+        function badgeClass(status) {
+            const map = {
+                crawling: 'badge-crawling',
+                embedding: 'badge-embedding',
+                completed: 'badge-completed',
+                failed: 'badge-failed',
+            };
+            return map[status] || 'badge-unknown';
+        }
+
+        function renderDomains(domains) {
+            const el = document.getElementById('domainsList');
+            if (!domains.length) {
+                el.innerHTML = '<div class="empty-state">No domains crawled yet.</div>';
+                return;
+            }
+
+            el.innerHTML = `
+                <table class="domain-table">
+                    <thead>
+                        <tr>
+                            <th>Domain</th>
+                            <th>Vectors</th>
+                            <th>Pages</th>
+                            <th>Status</th>
+                            <th>Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        ${domains.map(d => `
+                            <tr>
+                                <td>${escapeHtml(d.domain)}</td>
+                                <td>${d.vectors_count}</td>
+                                <td>${d.pages_crawled}</td>
+                                <td><span class="badge ${badgeClass(d.crawl_status)}">${escapeHtml(d.crawl_status)}</span></td>
+                                <td class="actions">
+                                    <button class="btn-secondary" onclick="recrawlDomain('${escapeHtml(d.domain)}')"
+                                        ${d.crawl_status === 'crawling' || d.crawl_status === 'embedding' ? 'disabled' : ''}>
+                                        Recrawl
+                                    </button>
+                                    <button class="btn-danger" onclick="deleteDomain('${escapeHtml(d.domain)}')"
+                                        ${d.crawl_status === 'crawling' || d.crawl_status === 'embedding' ? 'disabled' : ''}>
+                                        Delete
+                                    </button>
+                                </td>
+                            </tr>
+                        `).join('')}
+                    </tbody>
+                </table>
+            `;
+        }
+
+        function escapeHtml(str) {
+            const div = document.createElement('div');
+            div.textContent = str;
+            return div.innerHTML;
+        }
+
+        // --- Crawl form ---
+        document.getElementById('crawlForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const urlInput = document.getElementById('urlInput');
+            const btn = document.getElementById('crawlBtn');
+            const url = urlInput.value.trim();
+            if (!url) return;
+
+            btn.disabled = true;
+            btn.innerHTML = '<span class="spinner"></span>Starting...';
+
+            try {
+                const result = await apiPost('/api/crawl', { url });
+                showToast(result.message, 'success');
+                urlInput.value = '';
+                // Start polling for this domain
+                pollDomain(result.domain);
+            } catch (err) {
+                showToast(err.message, 'error');
+            } finally {
+                btn.disabled = false;
+                btn.textContent = 'Crawl';
+            }
+        });
+
+        // --- Poll domain status ---
+        function pollDomain(domain) {
+            const interval = setInterval(async () => {
+                try {
+                    const status = await apiGet(`/api/status/${domain}`);
+                    await loadDomains();
+                    await loadStats();
+                    if (status.status === 'completed') {
+                        clearInterval(interval);
+                        showToast(`Crawl complete for ${domain}: ${status.pages_crawled} pages, ${status.vectors_stored} vectors`, 'success');
+                    } else if (status.status === 'failed') {
+                        clearInterval(interval);
+                        showToast(`Crawl failed for ${domain}: ${status.error}`, 'error');
+                    }
+                } catch {
+                    clearInterval(interval);
+                }
+            }, 3000);
+        }
+
+        // --- Recrawl domain ---
+        async function recrawlDomain(domain) {
+            if (!confirm(`This will delete all existing data for "${domain}" and recrawl the entire site. Continue?`)) return;
+            try {
+                const result = await apiPost('/api/crawl', { url: `https://${domain}` });
+                showToast(result.message, 'success');
+                pollDomain(result.domain);
+            } catch (err) {
+                showToast(err.message, 'error');
+            }
+        }
+
+        // --- Delete domain ---
+        async function deleteDomain(domain) {
+            if (!confirm(`Delete all data for "${domain}"? This cannot be undone.`)) return;
+            try {
+                const result = await apiDelete(`/api/domain/${domain}`);
+                showToast(result.message, 'success');
+                await loadDomains();
+                await loadStats();
+            } catch (err) {
+                showToast(err.message, 'error');
+            }
+        }
+
+        // --- Initial load ---
+        loadStats();
+        loadDomains();
+        // Refresh every 10 seconds
+        setInterval(() => { loadStats(); loadDomains(); }, 10000);
+    </script>
+</body>
+</html>
