@@ -6,6 +6,7 @@ Usage: python -m src.scripts.crawl_site https://skill-wanderer.com
 import asyncio
 import logging
 import sys
+import uuid
 
 from src.services.crawler import WebCrawler
 from src.services.vector_store import VectorStore
@@ -29,15 +30,16 @@ async def main(url: str):
         logger.warning("No pages found. Exiting.")
         return
 
-    # Store in Qdrant
+    # Store in Qdrant. The previous generation is only retired once the new
+    # one has landed, so a failed upload leaves the existing data intact.
     store = VectorStore()
-    # Delete existing data for this domain first
-    deleted = store.delete_by_domain(crawler.root_domain)
-    if deleted > 0:
-        logger.info(f"Deleted {deleted} existing vectors for {crawler.root_domain}")
-
-    vectors = store.store_pages(pages)
+    crawl_id = str(uuid.uuid4())
+    vectors = store.store_pages(pages, crawl_id=crawl_id)
     logger.info(f"Stored {vectors} vectors in Qdrant.")
+
+    deleted = store.delete_by_domain(crawler.root_domain, exclude_crawl_id=crawl_id)
+    if deleted > 0:
+        logger.info(f"Retired {deleted} vectors from the previous crawl of {crawler.root_domain}")
 
     # Print summary
     print(f"\n{'='*50}")

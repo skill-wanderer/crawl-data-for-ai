@@ -8,6 +8,7 @@ Extracts text content, metadata, and stores the original domain for future subdo
 import asyncio
 import logging
 import sys
+import threading
 from urllib.parse import urljoin, urlparse
 from dataclasses import dataclass, field
 
@@ -39,6 +40,11 @@ class WebCrawler:
         self.include_subdomains = include_subdomains
         self.visited: set[str] = set()
         self.pages: list[CrawledPage] = []
+        self._stop_event = threading.Event()
+
+    def stop(self):
+        """Signal the crawler to stop as soon as possible."""
+        self._stop_event.set()
 
     def _is_same_domain(self, url: str) -> bool:
         """Check if a URL belongs to the same domain (or subdomain if enabled)."""
@@ -145,7 +151,15 @@ class WebCrawler:
         try:
             return loop.run_until_complete(self._crawl_impl())
         finally:
-            loop.close()
+            try:
+                # Cancel all remaining tasks before closing
+                pending = asyncio.all_tasks(loop)
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+            finally:
+                loop.close()
 
     async def _crawl_impl(self) -> list[CrawledPage]:
         """Core crawl logic using Playwright."""
@@ -167,6 +181,10 @@ class WebCrawler:
             self.pages.clear()
 
             while queue:
+                if self._stop_event.is_set():
+                    logger.info(f"Crawl stopped early for {self.root_domain}")
+                    break
+
                 url = queue.pop(0)
                 if url in self.visited:
                     continue
