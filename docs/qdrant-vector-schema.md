@@ -202,6 +202,7 @@ results = qdrant.query_points(
 | --------------- | -------- |
 | Re-crawl domain | Existing vectors remain untouched. Only chunks whose `(url, content_hash)` pair is not already stored are embedded and inserted. |
 | Checkpointing | Each unseen chunk is embedded and upserted before the next chunk is processed. A failed run can be retried without losing or repeating successful writes. |
+| URL processing order | One URL is crawled, checked, embedded, and stored before the crawler advances to the next URL. Extracted page bodies are not accumulated for a later bulk write. |
 | Full recrawl domain | Delete the domain first, then crawl it again to rebuild every vector from the current site. |
 | Delete domain   | Vectors are filtered by the `domain` payload field and removed. |
 | Multiple domains | The same collection holds vectors for all domains. Use the `domain` filter to scope queries. |

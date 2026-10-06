@@ -11,8 +11,10 @@ class FakeQdrantClient:
         self.existing_payloads = existing_payloads or []
         self.upserted = []
         self.upsert_call_sizes = []
+        self.scroll_calls = []
 
     def scroll(self, **kwargs):
+        self.scroll_calls.append(kwargs)
         records = [SimpleNamespace(payload=payload) for payload in self.existing_payloads]
         return records, None
 
@@ -115,6 +117,32 @@ class AdditiveStoreTests(unittest.TestCase):
 
         self.assertEqual(added, 1)
         self.assertEqual(store.client.upserted[0].payload["url"], second_page.url)
+
+    def test_streaming_session_checks_qdrant_separately_for_each_url(self):
+        store = make_store()
+        session = store.start_additive_crawl("example.com", crawl_id="crawl-test")
+        second_page = CrawledPage(
+            url="https://example.com/second",
+            domain="example.com",
+            title="Second",
+            content="Second page content long enough to crawl.",
+        )
+
+        self.assertEqual(store.client.scroll_calls, [])
+        store.store_page(self.page, session)
+        store.store_page(second_page, session)
+
+        self.assertEqual(len(store.client.scroll_calls), 2)
+        filters = [call_args["scroll_filter"] for call_args in store.client.scroll_calls]
+        filtered_urls = [
+            condition.match.value
+            for scroll_filter in filters
+            for condition in scroll_filter.must
+            if condition.key == "url"
+        ]
+        self.assertEqual(filtered_urls, [self.page.url, second_page.url])
+        self.assertEqual(session.pages_processed, 2)
+        self.assertEqual(session.added, 2)
 
     def test_each_successful_chunk_is_checkpointed_before_a_later_failure(self):
         store = make_store()

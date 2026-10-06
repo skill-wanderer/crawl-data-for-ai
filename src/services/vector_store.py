@@ -9,6 +9,7 @@ import hashlib
 import logging
 import time
 import uuid
+from dataclasses import dataclass
 from typing import Callable, TypeVar
 
 import grpc
@@ -73,6 +74,17 @@ def _point_id(domain: str, url: str, content_hash: str) -> str:
     """Return the same Qdrant point ID for the same source chunk."""
     identity = f"{domain}\0{url}\0{content_hash}"
     return str(uuid.uuid5(uuid.NAMESPACE_URL, identity))
+
+
+@dataclass
+class AdditiveCrawlSession:
+    """Progress and identity shared by one streaming domain crawl."""
+
+    domain: str
+    crawl_id: str
+    added: int = 0
+    skipped: int = 0
+    pages_processed: int = 0
 
 
 class VectorStore:
@@ -163,17 +175,20 @@ class VectorStore:
             embeddings.extend([e.values for e in result.embeddings])
         return embeddings
 
-    def _get_existing_chunk_keys(self, domain: str) -> set[tuple[str, str]]:
-        """Return ``(url, content_hash)`` keys already stored for a domain.
+    def _get_existing_chunk_keys(
+        self, domain: str, url: str | None = None
+    ) -> set[tuple[str, str]]:
+        """Return stored ``(url, content_hash)`` keys, optionally for one URL.
 
         Older points did not have ``content_hash`` in their payload, so derive
         it from their stored text during the transition instead of duplicating
         those vectors on the first additive recrawl.
         """
         domain_clean = self._clean_domain(domain)
-        domain_filter = Filter(
-            must=[FieldCondition(key="domain", match=MatchValue(value=domain_clean))]
-        )
+        must = [FieldCondition(key="domain", match=MatchValue(value=domain_clean))]
+        if url:
+            must.append(FieldCondition(key="url", match=MatchValue(value=url)))
+        existing_filter = Filter(must=must)
         existing: set[tuple[str, str]] = set()
         offset = None
 
@@ -182,7 +197,7 @@ class VectorStore:
                 "scroll existing chunks",
                 lambda o=offset: self.client.scroll(
                     collection_name=self.settings.qdrant_collection,
-                    scroll_filter=domain_filter,
+                    scroll_filter=existing_filter,
                     limit=self.settings.qdrant_scroll_batch_size,
                     offset=o,
                     with_payload=["url", "text", "content_hash"],
@@ -203,6 +218,101 @@ class VectorStore:
 
         return existing
 
+    def start_additive_crawl(
+        self, domain: str, crawl_id: str | None = None
+    ) -> AdditiveCrawlSession:
+        """Create progress state for a streaming, additive domain crawl."""
+        domain_clean = self._clean_domain(domain)
+        return AdditiveCrawlSession(
+            domain=domain_clean,
+            crawl_id=crawl_id or str(uuid.uuid4()),
+        )
+
+    def store_page(
+        self,
+        page: CrawledPage,
+        session: AdditiveCrawlSession,
+        on_checkpoint: Callable[[int], None] | None = None,
+    ) -> int:
+        """Check and immediately store every unseen chunk from one URL.
+
+        Existing keys are fetched from Qdrant only for this page's URL, keeping
+        memory bounded for large sites. Each successful write updates the local
+        key set before the next chunk, providing a durable checkpoint if a
+        later operation fails.
+        """
+        page_domain = self._clean_domain(page.domain)
+        if page_domain != session.domain:
+            raise ValueError(
+                f"Page domain {page_domain!r} does not match crawl session "
+                f"domain {session.domain!r}"
+            )
+
+        page_text = f"Title: {page.title}\n"
+        if page.meta_description:
+            page_text += f"Description: {page.meta_description}\n"
+        page_text += f"\n{page.content}"
+
+        chunks = _chunk_text(page_text)
+        existing_keys = self._get_existing_chunk_keys(session.domain, page.url)
+        added_for_page = 0
+        for idx, chunk in enumerate(chunks):
+            content_hash = _content_hash(chunk)
+            key = (page.url, content_hash)
+            if key in existing_keys:
+                session.skipped += 1
+                continue
+
+            logger.info(
+                "Embedding and storing new chunk %d/%d from %s",
+                idx + 1,
+                len(chunks),
+                page.url,
+            )
+            embeddings = self._get_embeddings([chunk])
+            if len(embeddings) != 1:
+                raise RuntimeError("Gemini did not return an embedding for the chunk")
+
+            point = PointStruct(
+                id=_point_id(session.domain, page.url, content_hash),
+                vector=embeddings[0],
+                payload={
+                    "text": chunk,
+                    "url": page.url,
+                    "domain": session.domain,
+                    "title": page.title,
+                    "meta_description": page.meta_description,
+                    "headings": page.headings,
+                    "chunk_index": idx,
+                    "total_chunks": len(chunks),
+                    "content_hash": content_hash,
+                    "crawl_id": session.crawl_id,
+                },
+            )
+            self._with_retry(
+                f"upsert chunk {idx + 1}/{len(chunks)} from {page.url}",
+                lambda p=point: self.client.upsert(
+                    collection_name=self.settings.qdrant_collection,
+                    points=[p],
+                ),
+            )
+
+            # Mark it as existing only after Qdrant confirms the write.
+            existing_keys.add(key)
+            session.added += 1
+            added_for_page += 1
+            if on_checkpoint:
+                on_checkpoint(session.added)
+            logger.info(
+                "Stored checkpoint %d: %s chunk %d",
+                session.added,
+                page.url,
+                idx + 1,
+            )
+
+        session.pages_processed += 1
+        return added_for_page
+
     def store_pages(self, pages: list[CrawledPage], crawl_id: str | None = None) -> int:
         """Add only previously unseen page chunks to Qdrant.
 
@@ -213,70 +323,19 @@ class VectorStore:
         before the next chunk is processed, so a later retry can resume after
         the last successful checkpoint. Returns the number of new points stored.
         """
-        crawl_id = crawl_id or str(uuid.uuid4())
         if not pages:
             logger.warning("No pages to store.")
             return 0
 
-        existing_by_domain = {
-            domain: self._get_existing_chunk_keys(domain)
-            for domain in {page.domain for page in pages}
-        }
-        added = 0
-        skipped = 0
-
+        sessions: dict[str, AdditiveCrawlSession] = {}
         for page in pages:
-            page_text = f"Title: {page.title}\n"
-            if page.meta_description:
-                page_text += f"Description: {page.meta_description}\n"
-            page_text += f"\n{page.content}"
+            domain = self._clean_domain(page.domain)
+            if domain not in sessions:
+                sessions[domain] = self.start_additive_crawl(domain, crawl_id)
+            self.store_page(page, sessions[domain])
 
-            chunks = _chunk_text(page_text)
-            for idx, chunk in enumerate(chunks):
-                content_hash = _content_hash(chunk)
-                key = (page.url, content_hash)
-                if key in existing_by_domain[page.domain]:
-                    skipped += 1
-                    continue
-
-                logger.info(
-                    "Embedding and storing new chunk %d/%d from %s",
-                    idx + 1,
-                    len(chunks),
-                    page.url,
-                )
-                embeddings = self._get_embeddings([chunk])
-                if len(embeddings) != 1:
-                    raise RuntimeError("Gemini did not return an embedding for the chunk")
-
-                point = PointStruct(
-                    id=_point_id(page.domain, page.url, content_hash),
-                    vector=embeddings[0],
-                    payload={
-                        "text": chunk,
-                        "url": page.url,
-                        "domain": page.domain,
-                        "title": page.title,
-                        "meta_description": page.meta_description,
-                        "headings": page.headings,
-                        "chunk_index": idx,
-                        "total_chunks": len(chunks),
-                        "content_hash": content_hash,
-                        "crawl_id": crawl_id,
-                    },
-                )
-                self._with_retry(
-                    f"upsert chunk {idx + 1}/{len(chunks)} from {page.url}",
-                    lambda p=point: self.client.upsert(
-                        collection_name=self.settings.qdrant_collection,
-                        points=[p],
-                    ),
-                )
-
-                # Mark it as existing only after Qdrant confirms the write.
-                existing_by_domain[page.domain].add(key)
-                added += 1
-                logger.info("Stored checkpoint %d: %s chunk %d", added, page.url, idx + 1)
+        added = sum(session.added for session in sessions.values())
+        skipped = sum(session.skipped for session in sessions.values())
 
         logger.info(
             "Added %d new vectors from %d crawled pages; skipped %d existing chunks.",

@@ -20,30 +20,30 @@ logger = logging.getLogger(__name__)
 async def main(url: str):
     logger.info(f"Starting crawl for: {url}")
 
-    # Crawl
+    # Check and store each URL before crawling the next one. Full page bodies
+    # and domain-wide Qdrant keys are not retained in memory.
     crawler = WebCrawler(url, include_subdomains=False)
-    pages = await crawler.crawl()
-    logger.info(f"Crawled {len(pages)} pages.")
-
-    if not pages:
-        logger.warning("No pages found. Exiting.")
-        return
-
-    # Add only chunks that are not already stored for the same source URL.
-    # Delete the domain first when a complete fresh crawl is required.
     store = VectorStore()
-    vectors = store.store_pages(pages)
-    logger.info(f"Added {vectors} new vectors to Qdrant.")
+    session = await asyncio.to_thread(
+        store.start_additive_crawl, crawler.root_domain
+    )
+
+    def store_crawled_page(page):
+        store.store_page(page, session)
+
+    await crawler.crawl(on_page=store_crawled_page, collect_pages=False)
+    logger.info(
+        f"Crawled {crawler.pages_crawled} pages and added "
+        f"{session.added} new vectors to Qdrant."
+    )
 
     # Print summary
     print(f"\n{'='*50}")
     print(f"Crawl Summary for {crawler.root_domain}")
     print(f"{'='*50}")
-    print(f"Pages crawled: {len(pages)}")
-    print(f"New vectors added: {vectors}")
+    print(f"Pages crawled: {crawler.pages_crawled}")
+    print(f"New vectors added: {session.added}")
     print(f"{'='*50}")
-    for page in pages:
-        print(f"  - {page.title}: {page.url}")
 
 
 if __name__ == "__main__":

@@ -9,6 +9,7 @@ import asyncio
 import logging
 import sys
 import threading
+from collections.abc import Callable
 from urllib.parse import urljoin, urlparse
 from dataclasses import dataclass, field
 
@@ -40,6 +41,7 @@ class WebCrawler:
         self.include_subdomains = include_subdomains
         self.visited: set[str] = set()
         self.pages: list[CrawledPage] = []
+        self.pages_crawled = 0
         self._stop_event = threading.Event()
 
     def stop(self):
@@ -134,22 +136,35 @@ class WebCrawler:
                 links.append(self._normalize_url(absolute))
         return links
 
-    async def crawl(self) -> list[CrawledPage]:
-        """Crawl the entire website and return extracted pages.
+    async def crawl(
+        self,
+        on_page: Callable[[CrawledPage], None] | None = None,
+        collect_pages: bool = True,
+    ) -> list[CrawledPage]:
+        """Crawl the website, optionally processing each URL immediately.
 
         On Windows, runs in a separate thread with a ProactorEventLoop
         because Playwright needs subprocess support that SelectorEventLoop lacks.
+        ``on_page`` completes before the crawler advances to the next URL.
+        Set ``collect_pages`` false for streaming crawls that should not retain
+        all extracted page content in memory.
         """
         if sys.platform == "win32":
-            return await asyncio.to_thread(self._crawl_in_proactor_loop)
-        return await self._crawl_impl()
+            return await asyncio.to_thread(
+                self._crawl_in_proactor_loop, on_page, collect_pages
+            )
+        return await self._crawl_impl(on_page, collect_pages)
 
-    def _crawl_in_proactor_loop(self) -> list[CrawledPage]:
+    def _crawl_in_proactor_loop(
+        self,
+        on_page: Callable[[CrawledPage], None] | None,
+        collect_pages: bool,
+    ) -> list[CrawledPage]:
         """Run the crawl in a new ProactorEventLoop (Windows only)."""
         loop = asyncio.ProactorEventLoop()
         asyncio.set_event_loop(loop)
         try:
-            return loop.run_until_complete(self._crawl_impl())
+            return loop.run_until_complete(self._crawl_impl(on_page, collect_pages))
         finally:
             try:
                 # Cancel all remaining tasks before closing
@@ -161,7 +176,11 @@ class WebCrawler:
             finally:
                 loop.close()
 
-    async def _crawl_impl(self) -> list[CrawledPage]:
+    async def _crawl_impl(
+        self,
+        on_page: Callable[[CrawledPage], None] | None = None,
+        collect_pages: bool = True,
+    ) -> list[CrawledPage]:
         """Core crawl logic using Playwright."""
         logger.info(f"Starting crawl of {self.base_url} (domain: {self.root_domain})")
 
@@ -179,6 +198,7 @@ class WebCrawler:
             queue = [self._normalize_url(self.base_url)]
             self.visited.clear()
             self.pages.clear()
+            self.pages_crawled = 0
 
             while queue:
                 if self._stop_event.is_set():
@@ -210,11 +230,10 @@ class WebCrawler:
                     html = await page.content()
                     await page.close()
 
-                    # Extract content
+                    # Extract content. Storage happens below, outside this
+                    # catch block, so a storage failure stops the crawl instead
+                    # of being mistaken for a skippable URL error.
                     crawled = self._extract_content(html, url)
-                    if crawled:
-                        self.pages.append(crawled)
-                        logger.info(f"Extracted: {crawled.title} ({len(crawled.content)} chars)")
 
                     # Extract and queue new links
                     new_links = self._extract_links(html, url)
@@ -226,7 +245,21 @@ class WebCrawler:
                     logger.error(f"Error crawling {url}: {e}")
                     continue
 
+                if crawled:
+                    self.pages_crawled += 1
+                    logger.info(
+                        f"Extracted: {crawled.title} ({len(crawled.content)} chars)"
+                    )
+                    if on_page:
+                        # Wait for checking, embedding, and Qdrant persistence
+                        # before advancing to the next URL.
+                        await asyncio.to_thread(on_page, crawled)
+                    if collect_pages:
+                        self.pages.append(crawled)
+
             await browser.close()
 
-        logger.info(f"Crawl complete. {len(self.pages)} pages extracted from {self.root_domain}")
+        logger.info(
+            f"Crawl complete. {self.pages_crawled} pages extracted from {self.root_domain}"
+        )
         return self.pages

@@ -14,7 +14,7 @@ from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, field_validator
 
 from src.services.crawler import WebCrawler
-from src.services.vector_store import VectorStore
+from src.services.vector_store import AdditiveCrawlSession, VectorStore
 
 logging.basicConfig(
     level=logging.INFO,
@@ -75,7 +75,7 @@ class DomainResponse(BaseModel):
 
 class JobStatus(BaseModel):
     domain: str
-    status: str  # "crawling", "embedding", "completed", "failed"
+    status: str  # "crawling", "completed", "failed"
     pages_crawled: int = 0
     vectors_stored: int = 0
     error: str | None = None
@@ -97,19 +97,25 @@ async def crawl_and_store(url: str, vector_store: VectorStore):
 
     crawler = WebCrawler(url, include_subdomains=False)
     try:
-        # Step 1: Crawl
-        pages = await crawler.crawl()
-        crawl_jobs[domain]["pages_crawled"] = len(pages)
-        crawl_jobs[domain]["status"] = "embedding"
+        # Process every URL as a streaming checkpoint:
+        # crawl -> check that URL in Qdrant -> embed -> store -> next URL.
+        session: AdditiveCrawlSession = await asyncio.to_thread(
+            vector_store.start_additive_crawl, domain
+        )
 
-        # Step 2: Add only chunks that are not already in Qdrant.
-        vectors_count = await asyncio.to_thread(vector_store.store_pages, pages)
-        crawl_jobs[domain]["vectors_stored"] = vectors_count
+        def update_vector_progress(total_added: int):
+            crawl_jobs[domain]["vectors_stored"] = total_added
+
+        def store_crawled_page(page):
+            crawl_jobs[domain]["pages_crawled"] += 1
+            vector_store.store_page(page, session, update_vector_progress)
+
+        await crawler.crawl(on_page=store_crawled_page, collect_pages=False)
 
         crawl_jobs[domain]["status"] = "completed"
         logger.info(
-            f"Additive crawl complete for {domain}: "
-            f"{len(pages)} pages scanned, {vectors_count} new vectors"
+            f"Streaming additive crawl complete for {domain}: "
+            f"{crawler.pages_crawled} pages scanned, {session.added} new vectors"
         )
 
     except asyncio.CancelledError:
