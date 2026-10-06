@@ -161,7 +161,10 @@ async def start_crawl(req: DomainRequest):
     return DomainResponse(
         domain=domain,
         status="started",
-        message=f"Additive crawl started for {domain}. Only new content will be added.",
+        message=(
+            f"Streaming crawl started for {domain}. Each URL will be checked "
+            "and stored before the next URL is crawled."
+        ),
     )
 
 

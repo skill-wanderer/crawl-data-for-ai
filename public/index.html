@@ -459,7 +459,7 @@
 
         // --- Recrawl domain ---
         async function recrawlDomain(domain) {
-            if (!confirm(`Scan "${domain}" and add only content that is not already stored? Existing data will remain unchanged.`)) return;
+            if (!confirm(`Scan "${domain}" one URL at a time and immediately add missing content? Existing data will remain unchanged.`)) return;
             try {
                 const result = await apiPost('/api/crawl', { url: `https://${domain}` });
                 showToast(result.message, 'success');
