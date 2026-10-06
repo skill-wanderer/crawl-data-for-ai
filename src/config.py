@@ -19,12 +19,10 @@ class Settings(BaseSettings):
     qdrant_timeout: int = 120
     qdrant_collection: str = "website_pages"
 
-    # --- Qdrant request sizing ---
-    # Points per upsert request. Smaller batches keep each request well inside
-    # network buffers and make a failure cheap to retry.
+    # Deprecated compatibility setting. Writes are now always checkpointed one
+    # chunk at a time so completed work survives a later failure.
     qdrant_upsert_batch_size: int = 32
-    # Points per scroll request when aggregating stats (payload-only, so this
-    # can be much larger than the upsert batch).
+    # Points per scroll request when aggregating stats or finding existing data.
     qdrant_scroll_batch_size: int = 1000
 
     # --- Qdrant retry policy (exponential backoff) ---
@@ -35,8 +33,8 @@ class Settings(BaseSettings):
     # --- Embeddings ---
     embedding_model: str = "gemini-embedding-001"
     embedding_dimension: int = 3072
-    # Texts per Gemini embed_content call. Independent of the Qdrant batch size;
-    # billing is per input token, so this affects request count, not cost.
+    # Maximum texts per direct Gemini embed_content call. Additive crawling
+    # always embeds one chunk at a time to preserve per-chunk checkpoints.
     embedding_batch_size: int = 100
 
     # --- Chunking ---

@@ -1,6 +1,6 @@
 from types import SimpleNamespace
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 from src.services.crawler import CrawledPage
 from src.services.vector_store import VectorStore, _content_hash, _point_id
@@ -10,13 +10,17 @@ class FakeQdrantClient:
     def __init__(self, existing_payloads=None):
         self.existing_payloads = existing_payloads or []
         self.upserted = []
+        self.upsert_call_sizes = []
 
     def scroll(self, **kwargs):
         records = [SimpleNamespace(payload=payload) for payload in self.existing_payloads]
         return records, None
 
     def upsert(self, **kwargs):
-        self.upserted.extend(kwargs["points"])
+        points = kwargs["points"]
+        self.upsert_call_sizes.append(len(points))
+        self.upserted.extend(points)
+        self.existing_payloads.extend(point.payload for point in points)
 
 
 def make_store(existing_payloads=None):
@@ -111,6 +115,37 @@ class AdditiveStoreTests(unittest.TestCase):
 
         self.assertEqual(added, 1)
         self.assertEqual(store.client.upserted[0].payload["url"], second_page.url)
+
+    def test_each_successful_chunk_is_checkpointed_before_a_later_failure(self):
+        store = make_store()
+        store._get_embeddings = Mock(
+            side_effect=[[[0.1]], RuntimeError("resource exhausted")]
+        )
+        chunks = ["first new chunk", "second new chunk", "third new chunk"]
+
+        with patch("src.services.vector_store._chunk_text", return_value=chunks):
+            with self.assertRaisesRegex(RuntimeError, "resource exhausted"):
+                store.store_pages([self.page], crawl_id="failed-crawl")
+
+        self.assertEqual(len(store.client.upserted), 1)
+        self.assertEqual(store.client.upserted[0].payload["text"], chunks[0])
+
+        # A retry sees the first checkpoint and continues with only the two
+        # chunks that did not land during the failed run.
+        store._get_embeddings = Mock(side_effect=lambda texts: [[0.2] for _ in texts])
+        with patch("src.services.vector_store._chunk_text", return_value=chunks):
+            added = store.store_pages([self.page], crawl_id="retry-crawl")
+
+        self.assertEqual(added, 2)
+        self.assertEqual(
+            [point.payload["text"] for point in store.client.upserted],
+            chunks,
+        )
+        self.assertEqual(store.client.upsert_call_sizes, [1, 1, 1])
+        self.assertEqual(
+            store._get_embeddings.call_args_list,
+            [call([chunks[1]]), call([chunks[2]])],
+        )
 
 
 if __name__ == "__main__":

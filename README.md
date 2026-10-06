@@ -112,8 +112,8 @@ public/
 
 1. **Crawl** — Playwright visits every same-domain page starting from the given URL, extracting text content, titles, headings, and metadata.
 2. **Chunk** — Long pages are split into overlapping chunks (2000 chars, 200 overlap) to stay within embedding model limits.
-3. **Embed** — Only chunks not already stored for that source URL are sent to the Gemini embedding API.
-4. **Store** — New vectors are stored in Qdrant with metadata (URL, domain, title, text, and an exact-content hash) for retrieval.
+3. **Embed** — Only chunks not already stored for that source URL are sent to the Gemini embedding API, one chunk at a time.
+4. **Store immediately** — Each new vector is upserted to Qdrant as soon as its embedding is returned, before processing the next chunk. Completed chunks remain stored if a later chunk fails.
 5. **Recrawl** — The crawler compares each chunk by source URL and exact content hash, then immediately adds only chunks that are not already stored. Existing vectors are never changed or removed.
 6. **Full recrawl** — Delete the domain first, then crawl it again. This is the only workflow that replaces all previously stored data.
 

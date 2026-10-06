@@ -14,6 +14,7 @@ from typing import Callable, TypeVar
 import grpc
 import httpx
 from google import genai
+from google.genai import errors as genai_errors
 from qdrant_client import QdrantClient
 from qdrant_client.http.exceptions import ResponseHandlingException, UnexpectedResponse
 from qdrant_client.models import (
@@ -89,12 +90,11 @@ class VectorStore:
             timeout=self.settings.qdrant_timeout,
         )
         logger.info(
-            "Qdrant client: %s:%s (grpc=%s, timeout=%ss, upsert_batch=%s)",
+            "Qdrant client: %s:%s (grpc=%s, timeout=%ss, writes=per-chunk)",
             self.settings.qdrant_host,
             self.settings.qdrant_grpc_port if self.settings.qdrant_prefer_grpc else self.settings.qdrant_port,
             self.settings.qdrant_prefer_grpc,
             self.settings.qdrant_timeout,
-            self.settings.qdrant_upsert_batch_size,
         )
         self.gemini_client = genai.Client(api_key=self.settings.gemini_api_key)
         self._ensure_collection()
@@ -106,6 +106,8 @@ class VectorStore:
         """Transport errors are retryable; so are 429 and 5xx responses."""
         if isinstance(exc, UnexpectedResponse):
             return exc.status_code == 429 or exc.status_code >= 500
+        if isinstance(exc, genai_errors.APIError):
+            return exc.code == 429 or exc.code >= 500
         return isinstance(exc, _RETRYABLE_EXCEPTIONS)
 
     def _with_retry(self, op_name: str, fn: Callable[[], T]) -> T:
@@ -151,9 +153,12 @@ class VectorStore:
         batch_size = self.settings.embedding_batch_size
         for i in range(0, len(texts), batch_size):
             batch = texts[i : i + batch_size]
-            result = self.gemini_client.models.embed_content(
-                model=self.settings.embedding_model,
-                contents=batch,
+            result = self._with_retry(
+                "Gemini embedding",
+                lambda b=batch: self.gemini_client.models.embed_content(
+                    model=self.settings.embedding_model,
+                    contents=b,
+                ),
             )
             embeddings.extend([e.values for e in result.embeddings])
         return embeddings
@@ -204,13 +209,23 @@ class VectorStore:
         A chunk is considered existing when its source URL and exact embedded
         text match a stored point in the same domain. Existing points are never
         updated or removed here; delete the domain first when a complete fresh
-        crawl is required. Returns the number of new points stored.
+        crawl is required. Every unseen chunk is embedded and durably upserted
+        before the next chunk is processed, so a later retry can resume after
+        the last successful checkpoint. Returns the number of new points stored.
         """
         crawl_id = crawl_id or str(uuid.uuid4())
-        all_chunks: list[dict] = []
+        if not pages:
+            logger.warning("No pages to store.")
+            return 0
+
+        existing_by_domain = {
+            domain: self._get_existing_chunk_keys(domain)
+            for domain in {page.domain for page in pages}
+        }
+        added = 0
+        skipped = 0
 
         for page in pages:
-            # Build a rich text representation for each page
             page_text = f"Title: {page.title}\n"
             if page.meta_description:
                 page_text += f"Description: {page.meta_description}\n"
@@ -219,98 +234,57 @@ class VectorStore:
             chunks = _chunk_text(page_text)
             for idx, chunk in enumerate(chunks):
                 content_hash = _content_hash(chunk)
-                all_chunks.append({
-                    "text": chunk,
-                    "url": page.url,
-                    "domain": page.domain,
-                    "title": page.title,
-                    "meta_description": page.meta_description,
-                    "headings": page.headings,
-                    "chunk_index": idx,
-                    "total_chunks": len(chunks),
-                    "content_hash": content_hash,
-                })
+                key = (page.url, content_hash)
+                if key in existing_by_domain[page.domain]:
+                    skipped += 1
+                    continue
 
-        if not all_chunks:
-            logger.warning("No chunks to store.")
-            return 0
+                logger.info(
+                    "Embedding and storing new chunk %d/%d from %s",
+                    idx + 1,
+                    len(chunks),
+                    page.url,
+                )
+                embeddings = self._get_embeddings([chunk])
+                if len(embeddings) != 1:
+                    raise RuntimeError("Gemini did not return an embedding for the chunk")
 
-        existing_by_domain = {
-            domain: self._get_existing_chunk_keys(domain)
-            for domain in {chunk["domain"] for chunk in all_chunks}
-        }
-        new_chunks: list[dict] = []
-        seen_in_crawl: set[tuple[str, str, str]] = set()
-        for chunk in all_chunks:
-            domain = chunk["domain"]
-            key = (chunk["url"], chunk["content_hash"])
-            crawl_key = (domain, *key)
-            if key in existing_by_domain[domain] or crawl_key in seen_in_crawl:
-                continue
-            seen_in_crawl.add(crawl_key)
-            new_chunks.append(chunk)
+                point = PointStruct(
+                    id=_point_id(page.domain, page.url, content_hash),
+                    vector=embeddings[0],
+                    payload={
+                        "text": chunk,
+                        "url": page.url,
+                        "domain": page.domain,
+                        "title": page.title,
+                        "meta_description": page.meta_description,
+                        "headings": page.headings,
+                        "chunk_index": idx,
+                        "total_chunks": len(chunks),
+                        "content_hash": content_hash,
+                        "crawl_id": crawl_id,
+                    },
+                )
+                self._with_retry(
+                    f"upsert chunk {idx + 1}/{len(chunks)} from {page.url}",
+                    lambda p=point: self.client.upsert(
+                        collection_name=self.settings.qdrant_collection,
+                        points=[p],
+                    ),
+                )
 
-        skipped = len(all_chunks) - len(new_chunks)
-        if not new_chunks:
-            logger.info("No new vectors to add; skipped %d existing chunks.", skipped)
-            return 0
-
-        logger.info(
-            "Generating embeddings for %d new chunks (%d existing chunks skipped)...",
-            len(new_chunks),
-            skipped,
-        )
-        texts = [c["text"] for c in new_chunks]
-        embeddings = self._get_embeddings(texts)
-
-        points = []
-        for chunk_data, embedding in zip(new_chunks, embeddings):
-            point = PointStruct(
-                id=_point_id(
-                    chunk_data["domain"],
-                    chunk_data["url"],
-                    chunk_data["content_hash"],
-                ),
-                vector=embedding,
-                payload={
-                    "text": chunk_data["text"],
-                    "url": chunk_data["url"],
-                    "domain": chunk_data["domain"],
-                    "title": chunk_data["title"],
-                    "meta_description": chunk_data["meta_description"],
-                    "headings": chunk_data["headings"],
-                    "chunk_index": chunk_data["chunk_index"],
-                    "total_chunks": chunk_data["total_chunks"],
-                    "content_hash": chunk_data["content_hash"],
-                    "crawl_id": crawl_id,
-                },
-            )
-            points.append(point)
-
-        # Upsert in batches. Point IDs are fixed before the loop, so a retried
-        # batch overwrites itself rather than creating duplicates.
-        batch_size = self.settings.qdrant_upsert_batch_size
-        total_batches = (len(points) + batch_size - 1) // batch_size
-        for batch_num, i in enumerate(range(0, len(points), batch_size), start=1):
-            batch = points[i : i + batch_size]
-            self._with_retry(
-                f"upsert batch {batch_num}/{total_batches}",
-                lambda b=batch: self.client.upsert(
-                    collection_name=self.settings.qdrant_collection,
-                    points=b,
-                ),
-            )
-            logger.info(
-                "Upserted batch %d/%d (%d points)", batch_num, total_batches, len(batch)
-            )
+                # Mark it as existing only after Qdrant confirms the write.
+                existing_by_domain[page.domain].add(key)
+                added += 1
+                logger.info("Stored checkpoint %d: %s chunk %d", added, page.url, idx + 1)
 
         logger.info(
             "Added %d new vectors from %d crawled pages; skipped %d existing chunks.",
-            len(points),
+            added,
             len(pages),
             skipped,
         )
-        return len(points)
+        return added
 
     @staticmethod
     def _clean_domain(domain: str) -> str:
