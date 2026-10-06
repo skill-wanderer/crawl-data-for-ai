@@ -37,8 +37,8 @@ Each point in the collection represents a **single text chunk** from a crawled p
 
 ### ID
 
-- Type: `UUID v4` (string)
-- Randomly generated per chunk.
+- New points use a deterministic `UUID v5` string. Legacy points created by older versions can retain their original random UUIDs.
+- Derived from the domain, source URL, and exact content hash, so retrying an insert cannot create another copy of the same chunk.
 
 ### Vector
 
@@ -66,6 +66,8 @@ This means the vector already encodes title and description context.
 | `headings`         | `string[]`   | List of `h1`, `h2`, `h3` heading texts extracted from the page. |
 | `chunk_index`      | `int`        | Zero-based index of this chunk within the page (e.g. `0`, `1`, `2`…). |
 | `total_chunks`     | `int`        | Total number of chunks the page was split into. |
+| `content_hash`     | `string`     | SHA-256 hash of the exact text sent to the embedding model. Used with `url` to detect existing chunks during an additive recrawl. |
+| `crawl_id`         | `string`     | UUID identifying the crawl run that first added this point. |
 
 ### Example Point (JSON)
 
@@ -81,7 +83,9 @@ This means the vector already encodes title and description context.
     "meta_description": "Learn more about our company.",
     "headings": ["About Us", "Our Mission", "Our Team"],
     "chunk_index": 0,
-    "total_chunks": 3
+    "total_chunks": 3,
+    "content_hash": "0f4c...64 hex characters...9a2d",
+    "crawl_id": "6f45146d-4111-47d0-a9ab-f29c7a0e55df"
   }
 }
 ```
@@ -196,7 +200,8 @@ results = qdrant.query_points(
 
 | Operation       | Behavior |
 | --------------- | -------- |
-| Re-crawl domain | All existing vectors for that domain are **deleted first**, then new vectors are inserted. Data is always fresh. |
+| Re-crawl domain | Existing vectors remain untouched. Only chunks whose `(url, content_hash)` pair is not already stored are embedded and inserted. |
+| Full recrawl domain | Delete the domain first, then crawl it again to rebuild every vector from the current site. |
 | Delete domain   | Vectors are filtered by the `domain` payload field and removed. |
 | Multiple domains | The same collection holds vectors for all domains. Use the `domain` filter to scope queries. |
 

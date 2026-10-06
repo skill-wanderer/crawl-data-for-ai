@@ -24,7 +24,8 @@ Web crawler that uses **Playwright** to scrape websites and stores the content i
 - **Domain-scoped storage** — each crawled page stores its root domain, ready for future subdomain support
 - **Qdrant vector database** — stores chunked page content as embeddings for semantic search
 - **Gemini embeddings** — uses Google's latest embedding model
-- **Web UI** — add domains, monitor crawl progress, recrawl, or delete domain data
+- **Additive recrawls** — recrawls embed and store only content chunks that are not already present
+- **Web UI** — add domains, monitor crawl progress, add new content, or delete domain data
 - **Background processing** — crawls run asynchronously without blocking the API
 
 ## Prerequisites
@@ -111,11 +112,14 @@ public/
 
 1. **Crawl** — Playwright visits every same-domain page starting from the given URL, extracting text content, titles, headings, and metadata.
 2. **Chunk** — Long pages are split into overlapping chunks (2000 chars, 200 overlap) to stay within embedding model limits.
-3. **Embed** — Each chunk is sent to the Gemini embedding API to generate a vector representation.
-4. **Store** — Vectors are stored in Qdrant with metadata (URL, domain, title, text) for retrieval.
-5. **Recrawl** — When recrawling, all existing vectors for that domain are deleted first, then fresh data is stored.
+3. **Embed** — Only chunks not already stored for that source URL are sent to the Gemini embedding API.
+4. **Store** — New vectors are stored in Qdrant with metadata (URL, domain, title, text, and an exact-content hash) for retrieval.
+5. **Recrawl** — The crawler compares each chunk by source URL and exact content hash, then immediately adds only chunks that are not already stored. Existing vectors are never changed or removed.
+6. **Full recrawl** — Delete the domain first, then crawl it again. This is the only workflow that replaces all previously stored data.
 
 Data is tagged with the **root domain** (e.g., `skill-wanderer.com`) so the chatbot microservice can query by domain, and future subdomain crawling will share the same domain tag.
+
+An additive recrawl intentionally keeps historical chunks. If an existing page changes, its new chunks are added and its older chunks remain available. Delete the domain before crawling when the database should contain only the website's current version.
 
 ## Future: Chatbot Integration
 

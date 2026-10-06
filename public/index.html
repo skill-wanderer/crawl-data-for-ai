@@ -392,7 +392,7 @@
                                 <td class="actions">
                                     <button class="btn-secondary" onclick="recrawlDomain('${escapeHtml(d.domain)}')"
                                         ${d.crawl_status === 'crawling' || d.crawl_status === 'embedding' ? 'disabled' : ''}>
-                                        Recrawl
+                                        Add New Content
                                     </button>
                                     <button class="btn-danger" onclick="deleteDomain('${escapeHtml(d.domain)}')"
                                         ${d.crawl_status === 'crawling' || d.crawl_status === 'embedding' ? 'disabled' : ''}>
@@ -446,7 +446,7 @@
                     await loadStats();
                     if (status.status === 'completed') {
                         clearInterval(interval);
-                        showToast(`Crawl complete for ${domain}: ${status.pages_crawled} pages, ${status.vectors_stored} vectors`, 'success');
+                        showToast(`Crawl complete for ${domain}: ${status.pages_crawled} pages scanned, ${status.vectors_stored} new vectors added`, 'success');
                     } else if (status.status === 'failed') {
                         clearInterval(interval);
                         showToast(`Crawl failed for ${domain}: ${status.error}`, 'error');
@@ -459,7 +459,7 @@
 
         // --- Recrawl domain ---
         async function recrawlDomain(domain) {
-            if (!confirm(`This will delete all existing data for "${domain}" and recrawl the entire site. Continue?`)) return;
+            if (!confirm(`Scan "${domain}" and add only content that is not already stored? Existing data will remain unchanged.`)) return;
             try {
                 const result = await apiPost('/api/crawl', { url: `https://${domain}` });
                 showToast(result.message, 'success');

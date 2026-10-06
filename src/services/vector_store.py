@@ -5,6 +5,7 @@ Handles storing, querying, and managing crawled page data in Qdrant.
 Uses Google Gemini API for generating text embeddings.
 """
 
+import hashlib
 import logging
 import time
 import uuid
@@ -60,6 +61,17 @@ def _chunk_text(text: str, chunk_size: int | None = None, overlap: int | None = 
         start += chunk_size - overlap
 
     return chunks
+
+
+def _content_hash(text: str) -> str:
+    """Return a stable identity for the exact text sent to the embedder."""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _point_id(domain: str, url: str, content_hash: str) -> str:
+    """Return the same Qdrant point ID for the same source chunk."""
+    identity = f"{domain}\0{url}\0{content_hash}"
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, identity))
 
 
 class VectorStore:
@@ -146,12 +158,53 @@ class VectorStore:
             embeddings.extend([e.values for e in result.embeddings])
         return embeddings
 
-    def store_pages(self, pages: list[CrawledPage], crawl_id: str | None = None) -> int:
-        """Store crawled pages in Qdrant. Returns number of points stored.
+    def _get_existing_chunk_keys(self, domain: str) -> set[tuple[str, str]]:
+        """Return ``(url, content_hash)`` keys already stored for a domain.
 
-        Every point is tagged with `crawl_id` so a caller can delete the
-        previous generation only after this one has landed successfully
-        (see `delete_by_domain(exclude_crawl_id=...)`).
+        Older points did not have ``content_hash`` in their payload, so derive
+        it from their stored text during the transition instead of duplicating
+        those vectors on the first additive recrawl.
+        """
+        domain_clean = self._clean_domain(domain)
+        domain_filter = Filter(
+            must=[FieldCondition(key="domain", match=MatchValue(value=domain_clean))]
+        )
+        existing: set[tuple[str, str]] = set()
+        offset = None
+
+        while True:
+            points, next_offset = self._with_retry(
+                "scroll existing chunks",
+                lambda o=offset: self.client.scroll(
+                    collection_name=self.settings.qdrant_collection,
+                    scroll_filter=domain_filter,
+                    limit=self.settings.qdrant_scroll_batch_size,
+                    offset=o,
+                    with_payload=["url", "text", "content_hash"],
+                    with_vectors=False,
+                ),
+            )
+            for point in points:
+                payload = point.payload or {}
+                url = payload.get("url")
+                text = payload.get("text")
+                content_hash = payload.get("content_hash")
+                if url and (content_hash or isinstance(text, str)):
+                    existing.add((url, content_hash or _content_hash(text)))
+
+            if next_offset is None:
+                break
+            offset = next_offset
+
+        return existing
+
+    def store_pages(self, pages: list[CrawledPage], crawl_id: str | None = None) -> int:
+        """Add only previously unseen page chunks to Qdrant.
+
+        A chunk is considered existing when its source URL and exact embedded
+        text match a stored point in the same domain. Existing points are never
+        updated or removed here; delete the domain first when a complete fresh
+        crawl is required. Returns the number of new points stored.
         """
         crawl_id = crawl_id or str(uuid.uuid4())
         all_chunks: list[dict] = []
@@ -165,6 +218,7 @@ class VectorStore:
 
             chunks = _chunk_text(page_text)
             for idx, chunk in enumerate(chunks):
+                content_hash = _content_hash(chunk)
                 all_chunks.append({
                     "text": chunk,
                     "url": page.url,
@@ -174,20 +228,49 @@ class VectorStore:
                     "headings": page.headings,
                     "chunk_index": idx,
                     "total_chunks": len(chunks),
+                    "content_hash": content_hash,
                 })
 
         if not all_chunks:
             logger.warning("No chunks to store.")
             return 0
 
-        logger.info(f"Generating embeddings for {len(all_chunks)} chunks...")
-        texts = [c["text"] for c in all_chunks]
+        existing_by_domain = {
+            domain: self._get_existing_chunk_keys(domain)
+            for domain in {chunk["domain"] for chunk in all_chunks}
+        }
+        new_chunks: list[dict] = []
+        seen_in_crawl: set[tuple[str, str, str]] = set()
+        for chunk in all_chunks:
+            domain = chunk["domain"]
+            key = (chunk["url"], chunk["content_hash"])
+            crawl_key = (domain, *key)
+            if key in existing_by_domain[domain] or crawl_key in seen_in_crawl:
+                continue
+            seen_in_crawl.add(crawl_key)
+            new_chunks.append(chunk)
+
+        skipped = len(all_chunks) - len(new_chunks)
+        if not new_chunks:
+            logger.info("No new vectors to add; skipped %d existing chunks.", skipped)
+            return 0
+
+        logger.info(
+            "Generating embeddings for %d new chunks (%d existing chunks skipped)...",
+            len(new_chunks),
+            skipped,
+        )
+        texts = [c["text"] for c in new_chunks]
         embeddings = self._get_embeddings(texts)
 
         points = []
-        for chunk_data, embedding in zip(all_chunks, embeddings):
+        for chunk_data, embedding in zip(new_chunks, embeddings):
             point = PointStruct(
-                id=str(uuid.uuid4()),
+                id=_point_id(
+                    chunk_data["domain"],
+                    chunk_data["url"],
+                    chunk_data["content_hash"],
+                ),
                 vector=embedding,
                 payload={
                     "text": chunk_data["text"],
@@ -198,6 +281,7 @@ class VectorStore:
                     "headings": chunk_data["headings"],
                     "chunk_index": chunk_data["chunk_index"],
                     "total_chunks": chunk_data["total_chunks"],
+                    "content_hash": chunk_data["content_hash"],
                     "crawl_id": crawl_id,
                 },
             )
@@ -220,7 +304,12 @@ class VectorStore:
                 "Upserted batch %d/%d (%d points)", batch_num, total_batches, len(batch)
             )
 
-        logger.info(f"Stored {len(points)} vectors for {len(pages)} pages.")
+        logger.info(
+            "Added %d new vectors from %d crawled pages; skipped %d existing chunks.",
+            len(points),
+            len(pages),
+            skipped,
+        )
         return len(points)
 
     @staticmethod
@@ -234,21 +323,12 @@ class VectorStore:
             .split("/")[0]
         )
 
-    def delete_by_domain(self, domain: str, exclude_crawl_id: str | None = None) -> int:
-        """Delete points for a domain. Returns count of deleted points.
-
-        If `exclude_crawl_id` is given, points from that crawl are kept - use it
-        to retire the previous generation only once the new one is stored.
-        """
+    def delete_by_domain(self, domain: str) -> int:
+        """Delete all points for a domain. Returns count of deleted points."""
         domain_clean = self._clean_domain(domain)
 
         conditions = Filter(
             must=[FieldCondition(key="domain", match=MatchValue(value=domain_clean))],
-            must_not=(
-                [FieldCondition(key="crawl_id", match=MatchValue(value=exclude_crawl_id))]
-                if exclude_crawl_id
-                else None
-            ),
         )
 
         count_result = self._with_retry(

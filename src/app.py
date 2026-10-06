@@ -4,7 +4,6 @@ FastAPI application with domain management endpoints and UI.
 
 import asyncio
 import logging
-import uuid
 from contextlib import asynccontextmanager
 from urllib.parse import urlparse
 
@@ -103,23 +102,15 @@ async def crawl_and_store(url: str, vector_store: VectorStore):
         crawl_jobs[domain]["pages_crawled"] = len(pages)
         crawl_jobs[domain]["status"] = "embedding"
 
-        # Step 2: Store in Qdrant under a fresh crawl_id
-        crawl_id = str(uuid.uuid4())
-        vectors_count = await asyncio.to_thread(
-            vector_store.store_pages, pages, crawl_id=crawl_id
-        )
+        # Step 2: Add only chunks that are not already in Qdrant.
+        vectors_count = await asyncio.to_thread(vector_store.store_pages, pages)
         crawl_jobs[domain]["vectors_stored"] = vectors_count
 
-        # Step 3: Only now retire the previous generation for this domain.
-        # If step 2 failed, the old vectors are still serving queries.
-        deleted = await asyncio.to_thread(
-            vector_store.delete_by_domain, domain, crawl_id
-        )
-        if deleted > 0:
-            logger.info(f"Retired {deleted} vectors from the previous crawl of {domain}")
-
         crawl_jobs[domain]["status"] = "completed"
-        logger.info(f"Crawl+store complete for {domain}: {len(pages)} pages, {vectors_count} vectors")
+        logger.info(
+            f"Additive crawl complete for {domain}: "
+            f"{len(pages)} pages scanned, {vectors_count} new vectors"
+        )
 
     except asyncio.CancelledError:
         crawler.stop()
@@ -145,8 +136,8 @@ async def index(request: Request):
 async def start_crawl(req: DomainRequest):
     """Start crawling a domain.
 
-    Existing vectors for the domain stay queryable and are replaced only after
-    the new crawl has been stored successfully.
+    Existing vectors stay untouched. Only content chunks that are not already
+    stored for the same source URL are added.
     """
     parsed = urlparse(req.url)
     domain = parsed.netloc.lower().removeprefix("www.")
@@ -155,8 +146,6 @@ async def start_crawl(req: DomainRequest):
     if domain in crawl_jobs and crawl_jobs[domain]["status"] in ("crawling", "embedding"):
         raise HTTPException(status_code=409, detail=f"Crawl already in progress for {domain}")
 
-    # Existing data is left in place and only retired once the new crawl has
-    # been stored successfully - see crawl_and_store().
     vector_store: VectorStore = app.state.vector_store
 
     # Start background crawl as a tracked asyncio task
@@ -166,7 +155,7 @@ async def start_crawl(req: DomainRequest):
     return DomainResponse(
         domain=domain,
         status="started",
-        message=f"Crawl started for {domain}. Existing vectors are kept until the new crawl completes.",
+        message=f"Additive crawl started for {domain}. Only new content will be added.",
     )
 
 
